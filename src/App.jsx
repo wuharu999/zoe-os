@@ -197,22 +197,31 @@ export default function App() {
       if (!error && data) setter(data.map(d => ({...d, id: safeId(d.id)})));
   };
 
+  // Fetch Wallpaper from DB
+  const fetchWallpaper = async () => {
+      const { data } = await supabase.from('settings').select('value').eq('key', 'wallpaper').single();
+      if(data) setWallpaperUrl(data.value);
+  };
+
   useEffect(() => {
     fetchData('files', setFiles);
     fetchData('messages', setMessages);
     fetchData('announcements', setNotifications, 'createdAt', false);
     fetchData('activity_logs', setLogs, 'timestamp', false);
+    fetchWallpaper(); // Load wallpaper on start
 
     const filesChannel = supabase.channel('files-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'files' }, () => fetchData('files', setFiles)).subscribe();
     const messagesChannel = supabase.channel('messages-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => fetchData('messages', setMessages)).subscribe();
     const announceChannel = supabase.channel('announcements-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'announcements' }, () => fetchData('announcements', setNotifications, 'createdAt', false)).subscribe();
     const logsChannel = supabase.channel('logs-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'activity_logs' }, () => fetchData('activity_logs', setLogs, 'timestamp', false)).subscribe();
+    const settingsChannel = supabase.channel('settings-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, () => fetchWallpaper()).subscribe();
 
     return () => { 
         supabase.removeChannel(filesChannel);
         supabase.removeChannel(messagesChannel);
         supabase.removeChannel(announceChannel);
         supabase.removeChannel(logsChannel);
+        supabase.removeChannel(settingsChannel);
     };
   }, []);
 
@@ -221,6 +230,34 @@ export default function App() {
   const logAction = async (action, details) => {
       await supabase.from('activity_logs').insert({ action, details, user: currentUser?.name || 'System', timestamp: Date.now() });
   };
+
+  // Save Wallpaper to DB
+  const saveWallpaper = async (url) => {
+      if(!url) return;
+      await supabase.from('settings').upsert({ key: 'wallpaper', value: url });
+      setWallpaperUrl(url); // Optimistic update
+      logAction("Changed Wallpaper", "Wallpaper updated");
+  };
+
+  // Delete old wallpaper logic
+  const deleteOldWallpaper = async () => {
+       try {
+           const { data } = await supabase.from('settings').select('value').eq('key', 'wallpaper').single();
+           if (!data || !data.value) return;
+
+           const oldUrl = data.value;
+           // Check if it's stored in our wallpapers folder
+           if (oldUrl.includes('zoe_files') && oldUrl.includes('/wallpapers/')) {
+               const pathParts = oldUrl.split('zoe_files/'); 
+               if (pathParts.length > 1) {
+                   const relativePath = decodeURIComponent(pathParts[1]);
+                   await supabase.storage.from('zoe_files').remove([relativePath]);
+               }
+           }
+       } catch (err) {
+           console.error("Failed to cleanup old wallpaper", err);
+       }
+   };
 
   const handleAppDragStart = (e, appId) => {
     e.stopPropagation(); 
@@ -314,15 +351,12 @@ export default function App() {
   const handlePermanentDelete = async (ids) => {
       if(!confirm("Permanently delete these items?")) return;
       
-      // Storage Cleanup: Find files with URLs (images/files) and delete them from Supabase Storage
       const filesToDelete = files.filter(f => ids.includes(safeId(f.id)));
       for (const f of filesToDelete) {
           if (f.url) {
              try {
-                // Fix: We can assume the url ends with the filename.
                 const pathParts = f.url.split('/');
-                const fileName = pathParts[pathParts.length - 1]; // e.g. 1723123_dog.png
-                // We uploaded to root of 'zoe_files'.
+                const fileName = pathParts[pathParts.length - 1]; 
                 if(fileName) await supabase.storage.from('zoe_files').remove([fileName]);
              } catch(e) { console.error("Storage delete fail", e); }
           }
@@ -364,7 +398,7 @@ export default function App() {
             if (uploadError) throw uploadError;
 
             const { data: { publicUrl } } = supabase.storage.from('zoe_files').getPublicUrl(filePath);
-            const defaultPos = targetPath === 'root' ? { x: 100, y: 100 } : {x: 100, y: 100}; // Simplified pos
+            const defaultPos = targetPath === 'root' ? { x: 100, y: 100 } : {x: 100, y: 100}; 
 
             await supabase.from('files').insert({
                 name: file.name, type: file.type.startsWith('image') ? 'image' : 'text', url: publicUrl, 
@@ -379,22 +413,27 @@ export default function App() {
   const handleUploadInput = (e) => {
       const file = e.target.files[0];
       if(!file) return;
-      // Use the ref to determine where to upload
       uploadFile(file, uploadTargetRef.current);
       if(fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  // UPDATED: Deletes old wallpaper, uploads new, sets DB
   const handleWallpaperUpload = async (e) => {
       const file = e.target.files[0];
       if (!file) return;
       try {
+          // 1. Upload NEW
           const filePath = `wallpapers/${Date.now()}_${file.name}`;
           const { error: uploadError } = await supabase.storage.from('zoe_files').upload(filePath, file);
           if (uploadError) throw uploadError;
 
           const { data: { publicUrl } } = supabase.storage.from('zoe_files').getPublicUrl(filePath);
-          setWallpaperUrl(publicUrl);
-          logAction("Changed Wallpaper", "New wallpaper uploaded and set");
+          
+          // 2. Delete OLD
+          await deleteOldWallpaper();
+
+          // 3. Save NEW
+          saveWallpaper(publicUrl); 
       } catch (error) {
           alert("Wallpaper Upload Failed: " + error.message);
       }
@@ -577,7 +616,7 @@ export default function App() {
                                 <div className="text-xs text-gray-500 mb-2">Paste a URL or upload a file.</div>
                                 <div className="flex gap-2 mb-2">
                                     <input className="flex-1 border p-1 text-sm" placeholder="Image URL..." value={wallpaperUrl} onChange={(e) => setWallpaperUrl(e.target.value)} />
-                                    <BevelButton onClick={() => setWallpaperUrl(wallpaperUrl)}>Set URL</BevelButton>
+                                    <BevelButton onClick={() => saveWallpaper(wallpaperUrl)}>Set URL</BevelButton>
                                 </div>
                                 <div className="flex gap-2 items-center border-t pt-2">
                                     <span className="text-xs font-bold">Upload:</span>
@@ -606,7 +645,7 @@ export default function App() {
                             return (
                             <div key={idStr} draggable={canEdit} onDragStart={(e) => handleDragStart(e, f)} onContextMenu={(e) => onContextMenu(e, idStr, 'explorer')} onClick={(e) => handleSelect(e, idStr)} onDoubleClick={() => { if (renamingId === idStr) return; handleOpenFile(f); }} onDrop={(e) => f.type === 'folder' ? handleDrop(e, idStr) : null} onDragOver={(e) => f.type === 'folder' ? e.preventDefault() : null} className={`flex flex-col items-center w-24 p-2 cursor-pointer border hover:border-dotted hover:border-blue-800 group ${selectedIds.includes(idStr) ? 'bg-blue-200 border-blue-800 border-dotted' : 'border-transparent'}`}>
                                 {f.type === 'folder' ? <PixelFolder /> : <PixelFile type={f.type} />}
-                                {renamingId === idStr ? <input autoFocus value={renameValue} onChange={e => setRenameValue(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleRename()} onClick={e => e.stopPropagation()} className="w-full text-xs text-black text-center mt-1"/> : <span onDoubleClick={(e) => { e.stopPropagation(); if(canEdit) { setRenamingId(idStr); setRenameValue(f.name); } }} className="text-white text-xs px-1 mt-1 font-medium bg-black/20 truncate w-full text-center select-none">{f.name}</span>}
+                                {renamingId === idStr ? <input autoFocus value={renameValue} onChange={e => setRenameValue(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleRename()} onClick={e => e.stopPropagation()} className="w-full text-xs text-black text-center mt-2 border border-blue-500"/> : <span onDoubleClick={(e) => { e.stopPropagation(); if(canEdit) { setRenamingId(idStr); setRenameValue(f.name); } }} className="text-white text-xs px-1 mt-1 font-medium bg-black/20 truncate w-full text-center select-none">{f.name}</span>}
                                 <span className="text-[9px] text-gray-500 w-full text-center hidden group-hover:block">By {f.createdBy || 'System'}</span>
                             </div>
                         )})}
