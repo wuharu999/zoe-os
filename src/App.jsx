@@ -7,6 +7,7 @@ const MAX_STORAGE_BYTES = 10 * 1024 * 1024; // 10MB Total
 const SYSTEM_RESERVED_BYTES = 2 * 1024 * 1024; // 2MB for "ZoeOS Code"
 const STORAGE_SAFETY_LIMIT = MAX_STORAGE_BYTES * 0.9;
 const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; 
+const ANNOUNCEMENT_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 Hours
 const EMOJIS = ['😀', '😂', '❤️', '👍', '🎉', '🔥', '😎', '🤔', '👋', '💩', '📷', '📍', '🚀', '💻', '🍕', '☕'];
 
 const DEFAULT_APP_POSITIONS = {
@@ -144,6 +145,9 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [currentPath, setCurrentPath] = useState('root');
   
+  // NEW: State for tracking locally closed announcements
+  const [closedAnnouncements, setClosedAnnouncements] = useState([]);
+
   // States
   const [openWindows, setOpenWindows] = useState({ finder: false, messenger: false, storage: false, announce: false, recycle: false, settings: false, notepad: false, viewer: false, activity: false });
   const [selectedIds, setSelectedIds] = useState([]); 
@@ -209,6 +213,13 @@ export default function App() {
     fetchData('announcements', setNotifications, 'createdAt', false);
     fetchData('activity_logs', setLogs, 'timestamp', false);
     fetchWallpaper(); // Load wallpaper on start
+
+    // Clean up old announcements (older than 24h)
+    const cleanupAnnouncements = async () => {
+        const cutoff = Date.now() - ANNOUNCEMENT_RETENTION_MS;
+        await supabase.from('announcements').delete().lt('createdAt', cutoff);
+    }
+    cleanupAnnouncements();
 
     const filesChannel = supabase.channel('files-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'files' }, () => fetchData('files', setFiles)).subscribe();
     const messagesChannel = supabase.channel('messages-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => fetchData('messages', setMessages)).subscribe();
@@ -581,9 +592,10 @@ export default function App() {
                 <ContextMenu {...contextMenu} onClose={() => setContextMenu({ ...contextMenu, isOpen: false })} actions={getMenuActions()} targetName={selectedIds.length > 1 ? `${selectedIds.length} items` : (contextMenu.targetId ? files.find(f => safeId(f.id) === contextMenu.targetId)?.name : (contextMenu.location === 'desktop' ? 'Desktop' : 'Folder'))} />
 
                 <div className="fixed top-4 right-4 z-[100] w-72 flex flex-col gap-2 items-end pointer-events-none">
-                    {notifications.map(n => (
-                        <div key={n.id} className="pointer-events-auto bg-yellow-100 border-2 border-yellow-400 text-black p-3 shadow-xl rounded w-full relative animate-in slide-in-from-right fade-in duration-300">
-                            <button onClick={() => supabase.from('announcements').delete().eq('id', n.id)} className="absolute top-1 right-1 text-gray-500 hover:text-black"><X size={14}/></button>
+                    {notifications.filter(n => !closedAnnouncements.includes(safeId(n.id))).map(n => (
+                        <div key={safeId(n.id)} className="pointer-events-auto bg-yellow-100 border-2 border-yellow-400 text-black p-3 shadow-xl rounded w-full relative animate-in slide-in-from-right fade-in duration-300">
+                            {/* UPDATED: Close button now sets LOCAL state (closedAnnouncements), doesn't delete from DB */}
+                            <button onClick={() => setClosedAnnouncements(prev => [...prev, safeId(n.id)])} className="absolute top-1 right-1 text-gray-500 hover:text-black"><X size={14}/></button>
                             <div className="flex items-center gap-1 font-bold text-xs text-yellow-800 mb-1"><Bell size={12} /> Announcement • {n.time}</div><div className="text-sm">{n.text}</div>
                         </div>
                     ))}
